@@ -5,8 +5,31 @@ Step 1: Screen with tickers (parallel fetches).
 Step 2: Confirm with orderbook (parallel fetches for both pairs simultaneously).
 Step 3: Execute — IOC limit buy at VWAP, market sell of exact qty received.
 """
-import subprocess, json, time, requests
+import subprocess, json, time, requests, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+ERROR_LOG = os.path.expanduser("~/.openclaw/logs/arb-errors.log")
+
+# Ensure correct revx CLI symlink (may get reset by npm/gateway restarts)
+REVX_BIN = "/usr/lib/node_modules/@revolut/revolut-x-cli/dist/bin/revx.js"
+if os.path.exists(REVX_BIN):
+    os.system(f"ln -sf {REVX_BIN} /usr/bin/revx")
+
+def log_error(context, raw_stdout="", raw_stderr="", extra=None):
+    """Log full API response on errors for engineering review."""
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    with open(ERROR_LOG, "a") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"Time: {ts}\n")
+        f.write(f"Context: {context}\n")
+        if extra:
+            f.write(f"Extra: {extra}\n")
+        if raw_stdout:
+            f.write(f"stdout: {raw_stdout[:2000]}\n")
+        if raw_stderr:
+            f.write(f"stderr: {raw_stderr[:500]}\n")
+        f.write(f"{'='*60}\n")
 
 TOKENS = [
     "ADA","AVAX","BCH","BNB","BONK","BTC","DOGE","DOT","ENA","ETH",
@@ -14,7 +37,7 @@ TOKENS = [
     "TRX","XLM","XRP"
 ]
 FEE = 0.0009
-MIN_TICKER_BPS = 5
+MIN_TICKER_BPS = 10
 TRADE_SIZES = [1000.0, 500.0, 100.0, 50.0]
 BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
@@ -51,11 +74,16 @@ def revx_run(args, timeout=10):
     except Exception as e:
         return str(e), 1
 
-def revx_json(args, timeout=8):
+def revx_json(args, timeout=8, log_on_error=None):
     try:
         r = subprocess.run(["revx"] + args, capture_output=True, text=True, timeout=timeout)
-        return json.loads(r.stdout)
-    except:
+        result = json.loads(r.stdout)
+        return result
+    except Exception as e:
+        if log_on_error:
+            raw_out = r.stdout if 'r' in dir() else ""
+            raw_err = r.stderr if 'r' in dir() else ""
+            log_error(log_on_error, raw_stdout=raw_out, raw_stderr=raw_err, extra=str(e))
         return None
 
 def get_ticker(symbol):
@@ -181,23 +209,32 @@ def execute_arb(token, buy_pair, buy_currency, sell_pair, ticker_bps, asks_buy, 
 
         # Step 2: Fetch order by ID to get actual filled_quantity and total_fee
         print(f"  Fetching order details: {buy_order_id}", flush=True)
-        buy_detail = revx_json(["order", "get", buy_order_id, "--output", "json"])
+        buy_detail = revx_json(
+            ["order", "get", buy_order_id, "--output", "json"],
+            log_on_error=f"order get failed: {token} buy {buy_order_id} pair={buy_pair} size={size}"
+        )
         if not buy_detail:
-            send_alert(f"⚠️ ARB ERROR: {token} — could not fetch buy order {buy_order_id}")
-            return
+            # Fallback: order get failed — use available balance directly
+            log_error(f"order get returned None: {token} {buy_order_id}", extra=f"pair={buy_pair} size={size}")
+            print(f"  order get failed — falling back to available balance", flush=True)
+            token_balance = get_balance(token)
+            if token_balance <= 0:
+                send_alert(f"⚠️ ARB ERROR: {token} — order get failed and no balance found. Manual check needed!\nOrder: {buy_order_id}")
+                return
+            print(f"  Fallback balance: {token_balance:.8f} {token}", flush=True)
+            send_alert(f"⚠️ ARB FALLBACK: {token}\nOrder get failed, selling available balance: {token_balance:.5f}\nOrder: {buy_order_id}")
+        else:
+            buy_status     = (buy_detail.get("data", {}).get("status") or "").lower()
+            buy_filled_qty = float(buy_detail.get("data", {}).get("filled_quantity") or 0)
+            print(f"  status={buy_status} filled_qty={buy_filled_qty}", flush=True)
 
-        buy_status     = (buy_detail.get("data", {}).get("status") or "").lower()
-        buy_filled_qty = float(buy_detail.get("data", {}).get("filled_quantity") or 0)
+            if buy_status in ("cancelled", "rejected") or buy_filled_qty == 0:
+                send_alert(f"⚠️ IOC BUY NOT FILLED: {token}\nStatus: {buy_status} | Filled qty: {buy_filled_qty}")
+                return
 
-        print(f"  status={buy_status} filled_qty={buy_filled_qty}", flush=True)
-
-        if buy_status in ("cancelled", "rejected") or buy_filled_qty == 0:
-            send_alert(f"⚠️ IOC BUY NOT FILLED: {token}\nStatus: {buy_status} | Filled qty: {buy_filled_qty}")
-            return
-
-        # Use actual available balance as sell qty (accounts for any fees deducted)
-        token_balance = get_balance(token)
-        print(f"  Available {token} balance for sell: {token_balance:.8f}", flush=True)
+            # Use actual available balance as sell qty
+            token_balance = get_balance(token)
+            print(f"  Available {token} balance for sell: {token_balance:.8f}", flush=True)
 
         if token_balance <= 0:
             send_alert(f"⚠️ ARB ERROR: {token} — no available balance to sell after buy")
@@ -221,14 +258,18 @@ def execute_arb(token, buy_pair, buy_currency, sell_pair, ticker_bps, asks_buy, 
         try:
             sell_order_id = json.loads(sell_out).get("data", {}).get("id", "") or json.loads(sell_out).get("data", {}).get("venue_order_id", "")
             if sell_order_id:
-                sell_detail = revx_json(["order", "get", sell_order_id, "--output", "json"])
-                buy_paid   = float((buy_detail  or {}).get("data", {}).get("filled_amount") or 0)
+                sell_detail = revx_json(
+                    ["order", "get", sell_order_id, "--output", "json"],
+                    log_on_error=f"sell order get failed: {token} sell {sell_order_id} pair={sell_pair}"
+                )
+                # If buy_detail unavailable (order get fallback), use trade size as buy_paid
+                buy_paid   = float((buy_detail or {}).get("data", {}).get("filled_amount") or 0) or size
                 sell_gross = float((sell_detail or {}).get("data", {}).get("filled_amount") or 0)
                 sell_fee   = float((sell_detail or {}).get("data", {}).get("total_fee")     or 0)
                 sell_net   = sell_gross - sell_fee
                 actual_pnl = sell_net - buy_paid
                 actual_pnl_str = f"${actual_pnl:+.4f}"
-                print(f"  Actual P&L: buy_paid={buy_paid:.4f} sell_gross={sell_gross:.4f} sell_fee={sell_fee:.4f} sell_net={sell_net:.4f} pnl={actual_pnl_str}", flush=True)
+                print(f"  [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Actual P&L: buy_paid={buy_paid:.4f} sell_gross={sell_gross:.4f} sell_fee={sell_fee:.4f} sell_net={sell_net:.4f} pnl={actual_pnl_str}", flush=True)
         except Exception as e:
             print(f"  P&L calc error: {e}", flush=True)
 
@@ -290,26 +331,31 @@ def check_and_execute():
     if not candidates:
         return
 
-    # Step 2 + 3: Orderbook confirm and tiered execution
-    for token, bps_1, bps_2 in candidates:
-        print(f"  [{time.strftime('%H:%M:%S')}] Confirming {token} (L1={bps_1:.1f} L2={bps_2:.1f}bps)...", flush=True)
+    # Sort candidates by best bps descending — execute only the top opportunity
+    candidates.sort(key=lambda c: max(c[1], c[2]), reverse=True)
+    best = candidates[0]
+    token, bps_1, bps_2 = best
+    best_bps = max(bps_1, bps_2)
+    print(f"  [{time.strftime('%H:%M:%S')}] {len(candidates)} candidate(s) — executing best: {token} ({best_bps:.1f}bps)", flush=True)
+    if len(candidates) > 1:
+        others = [(c[0], max(c[1],c[2])) for c in candidates[1:]]
+        print(f"  Skipped: {others}", flush=True)
 
-        # Fetch both orderbooks simultaneously
-        ob_usdc, ob_usd = get_orderbooks(token)
-        if not ob_usdc or not ob_usd:
-            continue
+    # Step 2: Fetch orderbooks for best candidate
+    ob_usdc, ob_usd = get_orderbooks(token)
+    if not ob_usdc or not ob_usd:
+        return
 
-        asks_usdc = ob_usdc["data"]["asks"]
-        bids_usdc = ob_usdc["data"]["bids"]
-        asks_usd  = ob_usd["data"]["asks"]
-        bids_usd  = ob_usd["data"]["bids"]
+    asks_usdc = ob_usdc["data"]["asks"]
+    bids_usdc = ob_usdc["data"]["bids"]
+    asks_usd  = ob_usd["data"]["asks"]
+    bids_usd  = ob_usd["data"]["bids"]
 
-        if bps_1 > MIN_TICKER_BPS:
-            execute_arb(token, f"{token}-USDC", "USDC", f"{token}-USD", bps_1, asks_usdc, bids_usd)
-            continue
-
-        if bps_2 > MIN_TICKER_BPS:
-            execute_arb(token, f"{token}-USD", "USD", f"{token}-USDC", bps_2, asks_usd, bids_usdc)
+    # Step 3: Execute best direction
+    if bps_1 >= bps_2 and bps_1 > MIN_TICKER_BPS:
+        execute_arb(token, f"{token}-USDC", "USDC", f"{token}-USD", bps_1, asks_usdc, bids_usd)
+    elif bps_2 > MIN_TICKER_BPS:
+        execute_arb(token, f"{token}-USD", "USD", f"{token}-USDC", bps_2, asks_usd, bids_usdc)
 
 print("Loading pair configs...", flush=True)
 PAIR_DECIMALS.update(load_pair_configs())
