@@ -6,7 +6,5 @@ telegram.env
 *.bak*
 __pycache__/
 # scripts still containing plaintext token - move to telegram.env first
-tg-relay.py
-mem-alert.sh
 # old updater that pulled the removed cli-k9x2a package
 update-revx-skills.sh
