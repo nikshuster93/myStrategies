@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""
+Monitor USDC/USD arb opportunities on RevX.
+Step 1: Screen with tickers (parallel fetches).
+Step 2: Confirm with orderbook (parallel fetches for both pairs simultaneously).
+Step 3: Re-check live tickers, then execute — market buy, market sell of qty received.
+"""
+import subprocess, json, time, requests, os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+ERROR_LOG = os.path.expanduser("~/.openclaw/logs/arb-errors.log")
+
+# Ensure correct revx CLI symlink (may get reset by npm/gateway restarts)
+REVX_BIN = "/usr/lib/node_modules/@revolut/revolut-x-cli/dist/bin/revx.js"
+if os.path.exists(REVX_BIN):
+    os.system(f"ln -sf {REVX_BIN} /usr/bin/revx")
+
+def log_error(context, raw_stdout="", raw_stderr="", extra=None):
+    """Log full API response on errors for engineering review."""
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    with open(ERROR_LOG, "a") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"Time: {ts}\n")
+        f.write(f"Context: {context}\n")
+        if extra:
+            f.write(f"Extra: {extra}\n")
+        if raw_stdout:
+            f.write(f"stdout: {raw_stdout[:2000]}\n")
+        if raw_stderr:
+            f.write(f"stderr: {raw_stderr[:500]}\n")
+        f.write(f"{'='*60}\n")
+
+TOKENS = [
+    "ADA","AVAX","BCH","BNB","BONK","BTC","DOGE","DOT","ENA","ETH",
+    "HBAR","JUP","LINK","LTC","PEPE","SHIB","SOL","SUI","TON","TRUMP",
+    "TRX","XLM","XRP"
+]
+FEE = 0.0009
+MIN_TICKER_BPS = 10
+MAX_EDGE_BPS = 100  # edges above this are almost always phantom quotes; skip
+TRADE_SIZES = [1000.0, 500.0, 100.0, 50.0]
+SELL_DEPTH_MULT = 2.0  # sell-leg bids must hold at least this multiple of the trade size
+SELL_DEPTH_WINDOW_BPS = 50  # ...within this many bps of the best bid
+def _load_bot_token():
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not tok:
+        with open("/root/.openclaw/telegram.env") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    tok = line.split("=", 1)[1].strip().strip('"').strip("'")
+    if not tok:
+        raise SystemExit("TELEGRAM_BOT_TOKEN missing (set it in /root/.openclaw/telegram.env)")
+    return tok
+
+BOT_TOKEN = _load_bot_token()
+CHAT_ID = "437052622"
+
+# Preload quote_step for all relevant pairs
+def load_pair_configs():
+    data = revx_json(["market", "pairs", "--output", "json"])
+    configs = {}
+    try:
+        pairs = data if isinstance(data, list) else data.get("pairs", data.get("data", []))
+        for p in pairs:
+            sym = p.get("symbol", "").replace("/", "-")
+            qs = p.get("quote_step")
+            if qs:
+                # Use Decimal to correctly handle scientific notation (e.g. 1e-05)
+                from decimal import Decimal
+                decimals = max(0, -Decimal(str(qs)).as_tuple().exponent)
+                configs[sym] = decimals
+    except:
+        pass
+    return configs
+
+PAIR_DECIMALS = {}  # populated at startup
+
+def round_to_step(price, symbol):
+    """Round price to the quote_step precision for the given symbol."""
+    decimals = PAIR_DECIMALS.get(symbol, 8)
+    return round(price, decimals)
+
+def revx_run(args, timeout=10):
+    try:
+        r = subprocess.run(["revx"] + args, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode
+    except Exception as e:
+        return str(e), 1
+
+def revx_json(args, timeout=8, log_on_error=None):
+    try:
+        r = subprocess.run(["revx"] + args, capture_output=True, text=True, timeout=timeout)
+        result = json.loads(r.stdout)
+        return result
+    except Exception as e:
+        if log_on_error:
+            raw_out = r.stdout if 'r' in dir() else ""
+            raw_err = r.stderr if 'r' in dir() else ""
+            log_error(log_on_error, raw_stdout=raw_out, raw_stderr=raw_err, extra=str(e))
+        return None
+
+def get_ticker(symbol):
+    data = revx_json(["market", "tickers", symbol, "--output", "json"])
+    try:
+        t = data["data"][0]
+        return float(t["ask"]), float(t["bid"])
+    except:
+        return None, None
+
+def get_ticker_pair(token):
+    """Fetch USDC and USD tickers in parallel."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_usdc = ex.submit(get_ticker, f"{token}-USDC")
+        f_usd  = ex.submit(get_ticker, f"{token}-USD")
+        usdc_ask, usdc_bid = f_usdc.result()
+        usd_ask,  usd_bid  = f_usd.result()
+    return usdc_ask, usdc_bid, usd_ask, usd_bid
+
+def get_orderbooks(token):
+    """Fetch both orderbooks simultaneously."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_usdc = ex.submit(revx_json, ["market", "orderbook", f"{token}-USDC", "--limit", "192", "--output", "json"])
+        f_usd  = ex.submit(revx_json, ["market", "orderbook", f"{token}-USD",  "--limit", "192", "--output", "json"])
+        ob_usdc = f_usdc.result()
+        ob_usd  = f_usd.result()
+    return ob_usdc, ob_usd
+
+def get_balance(currency):
+    data = revx_json(["account", "balances", currency, "--output", "json"])
+    try:
+        if isinstance(data, dict) and "available" in data:
+            return float(data["available"])
+        items = data.get("data", data) if isinstance(data, dict) else data
+        for b in items:
+            if b["currency"].upper() == currency.upper():
+                return float(b["available"])
+    except:
+        pass
+    return 0.0
+
+def vwap_from_book(levels, size_usd, is_ask=True):
+    """Returns (vwap, worst_price) or (None, None) if insufficient depth.
+    worst_price = max ask level touched (for buy limit price) or min bid level touched."""
+    sorted_levels = sorted(levels, key=lambda l: float(l["price"]), reverse=not is_ask)
+    filled_usd = 0.0
+    filled_qty = 0.0
+    worst_price = None
+    for level in sorted_levels:
+        price = float(level["price"])
+        qty   = float(level["quantity"])
+        level_usd = qty * price
+        needed = size_usd - filled_usd
+        worst_price = price
+        if level_usd >= needed:
+            filled_qty += needed / price
+            filled_usd += needed
+            break
+        else:
+            filled_qty += qty
+            filled_usd += level_usd
+    if filled_usd < size_usd * 0.999:
+        return None, None
+    return filled_usd / filled_qty, worst_price
+
+def send_alert(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg},
+            timeout=5
+        )
+    except:
+        pass
+
+def execute_arb(token, buy_pair, buy_currency, sell_pair, ticker_bps, asks_buy, bids_sell):
+    buy_balance = get_balance(buy_currency)
+
+    for size in TRADE_SIZES:
+        buy_vwap,  buy_worst  = vwap_from_book(asks_buy,  size, is_ask=True)
+        sell_vwap, sell_worst = vwap_from_book(bids_sell, size, is_ask=False)
+        if not buy_vwap or not sell_vwap:
+            print(f"  Insufficient depth at ${size:.0f} — trying smaller...", flush=True)
+            continue
+
+        net_bps = ((sell_vwap*(1-FEE)) - (buy_vwap/(1-FEE))) / buy_vwap * 10000
+        if net_bps <= MIN_TICKER_BPS:
+            print(f"  Not profitable at ${size:.0f}: {net_bps:.1f}bps — trying smaller...", flush=True)
+            continue
+        if net_bps > MAX_EDGE_BPS:
+            print(f"  Implausible edge at ${size:.0f}: {net_bps:.1f}bps > {MAX_EDGE_BPS} (book) — skipping", flush=True)
+            return
+
+        best_bid = max(float(l["price"]) for l in bids_sell)
+        floor_px = best_bid * (1 - SELL_DEPTH_WINDOW_BPS / 10000)
+        near_bids = [l for l in bids_sell if float(l["price"]) >= floor_px]
+        depth_vwap, _ = vwap_from_book(near_bids, size * SELL_DEPTH_MULT, is_ask=False)
+        if not depth_vwap:
+            print(f"  Sell-leg depth < {SELL_DEPTH_MULT:g}x within {SELL_DEPTH_WINDOW_BPS}bps at ${size:.0f} (need ${size*SELL_DEPTH_MULT:.0f} of bids) — trying smaller...", flush=True)
+            continue
+
+        if buy_balance < size:
+            print(f"  Insufficient {buy_currency} for ${size:.0f} ({buy_balance:.2f}) — trying smaller...", flush=True)
+            continue
+
+        print(f"  ✅ Executing at ${size:.0f} ({net_bps:.1f}bps) | buy_vwap={buy_vwap:.6f} sell_vwap={sell_vwap:.6f}", flush=True)
+
+        # Pre-buy check: fresh best ask (buy pair) and best bid (sell pair) must still clear the minimum edge
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_buy  = ex.submit(get_ticker, buy_pair)
+            f_sell = ex.submit(get_ticker, sell_pair)
+            live_buy_ask, _      = f_buy.result()
+            _, live_sell_bid     = f_sell.result()
+        if not live_buy_ask or not live_sell_bid:
+            print(f"  Pre-buy ticker fetch failed — skipping", flush=True)
+            return
+        live_bps = ((live_sell_bid*(1-FEE)) - (live_buy_ask/(1-FEE))) / live_buy_ask * 10000
+        if live_bps <= MIN_TICKER_BPS:
+            print(f"  Pre-buy ticker check failed: ask {live_buy_ask} bid {live_sell_bid} = {live_bps:.1f}bps (book said {net_bps:.1f}bps) — skipping", flush=True)
+            return
+        if live_bps > MAX_EDGE_BPS:
+            print(f"  Implausible edge: ask {live_buy_ask} bid {live_sell_bid} = {live_bps:.1f}bps > {MAX_EDGE_BPS} (ticker) — skipping", flush=True)
+            return
+        print(f"  Pre-buy ticker OK: ask {live_buy_ask} bid {live_sell_bid} = {live_bps:.1f}bps", flush=True)
+
+        # Leg 1: market buy
+        print(f"  → BUY {buy_pair} --quote {size} --market", flush=True)
+        buy_out, buy_rc = revx_run([
+            "order", "place", buy_pair, "buy",
+            "--quote", str(size),
+            "--market",
+            "--output", "json"
+        ])
+        print(f"  BUY result: {buy_out[:200]}", flush=True)
+
+        # Step 1: Check place response for immediate cancellation
+        if not buy_out or buy_out.strip() == "":
+            print(f"  Buy returned empty — skipping", flush=True)
+            send_alert(f"⚠️ BUY FAILED: {token}\nPair: {buy_pair} | Size: ${size:.0f}")
+            return
+        try:
+            buy_place = json.loads(buy_out)
+            place_state = buy_place.get("data", {}).get("state", "")
+            buy_order_id = buy_place.get("data", {}).get("id", "") or buy_place.get("data", {}).get("venue_order_id", "")
+            if place_state in ("cancelled", "rejected"):
+                print(f"  Buy rejected (state={place_state})", flush=True)
+                send_alert(f"⚠️ BUY FAILED: {token}\nPair: {buy_pair} | Size: ${size:.0f}\nState: {place_state}")
+                return
+        except:
+            print(f"  Buy result not parseable — skipping", flush=True)
+            return
+
+        # Step 2: Fetch order by ID to get actual filled_quantity and total_fee
+        print(f"  Fetching order details: {buy_order_id}", flush=True)
+        buy_detail = revx_json(
+            ["order", "get", buy_order_id, "--output", "json"],
+            log_on_error=f"order get failed: {token} buy {buy_order_id} pair={buy_pair} size={size}"
+        )
+        if not buy_detail:
+            # Fallback: order get failed — use available balance directly
+            log_error(f"order get returned None: {token} {buy_order_id}", extra=f"pair={buy_pair} size={size}")
+            print(f"  order get failed — falling back to available balance", flush=True)
+            token_balance = get_balance(token)
+            if token_balance <= 0:
+                send_alert(f"⚠️ ARB ERROR: {token} — order get failed and no balance found. Manual check needed!\nOrder: {buy_order_id}")
+                return
+            print(f"  Fallback balance: {token_balance:.8f} {token}", flush=True)
+            send_alert(f"⚠️ ARB FALLBACK: {token}\nOrder get failed, selling available balance: {token_balance:.5f}\nOrder: {buy_order_id}")
+        else:
+            buy_status     = (buy_detail.get("data", {}).get("status") or "").lower()
+            buy_filled_qty = float(buy_detail.get("data", {}).get("filled_quantity") or 0)
+            print(f"  status={buy_status} filled_qty={buy_filled_qty}", flush=True)
+
+            if buy_status in ("cancelled", "rejected") or buy_filled_qty == 0:
+                send_alert(f"⚠️ IOC BUY NOT FILLED: {token}\nStatus: {buy_status} | Filled qty: {buy_filled_qty}")
+                return
+
+            # Use actual available balance as sell qty
+            token_balance = get_balance(token)
+            print(f"  Available {token} balance for sell: {token_balance:.8f}", flush=True)
+
+        if token_balance <= 0:
+            send_alert(f"⚠️ ARB ERROR: {token} — no available balance to sell after buy")
+            return
+
+        # Leg 2: Market sell using filled_qty - base_fee from order details
+        print(f"  → SELL {sell_pair} --qty {token_balance} --market", flush=True)
+        sell_out, sell_rc = revx_run([
+            "order", "place", sell_pair, "sell",
+            "--qty", str(token_balance),
+            "--market", "--output", "json"
+        ])
+        print(f"  SELL result: {sell_out[:200]}", flush=True)
+
+        if not sell_out or sell_out.strip() == "":
+            send_alert(f"⚠️ SELL FAILED: {token}\nSell {token_balance:.5f} via {sell_pair} returned empty.\nManual sell needed!")
+            return
+
+        # Compute actual P&L — reuse buy_detail already fetched, get sell details by ID
+        actual_pnl_str = "(unknown)"
+        try:
+            sell_order_id = json.loads(sell_out).get("data", {}).get("id", "") or json.loads(sell_out).get("data", {}).get("venue_order_id", "")
+            if sell_order_id:
+                # Exchange may not index a fresh order yet: first try after 2s, then up to 5 retries 3s apart (~17s worst case)
+                sell_detail = None
+                for attempt in range(6):
+                    time.sleep(2.0 if attempt == 0 else 3.0)
+                    sell_detail = revx_json(
+                        ["order", "get", sell_order_id, "--output", "json"],
+                        log_on_error=(f"sell order get failed: {token} sell {sell_order_id} pair={sell_pair}"
+                                      if attempt == 5 else None)
+                    )
+                    if sell_detail:
+                        break
+                # If buy_detail unavailable (order get fallback), use trade size as buy_paid
+                buy_paid   = float((buy_detail or {}).get("data", {}).get("filled_amount") or 0) or size
+                sell_gross = float((sell_detail or {}).get("data", {}).get("filled_amount") or 0)
+                sell_fee   = float((sell_detail or {}).get("data", {}).get("total_fee")     or 0)
+                # If sell_detail unavailable, P&L is unknown — don't report misleading number
+                sell_net = sell_gross - sell_fee
+                if sell_gross == 0:
+                    actual_pnl_str = "(sell order fetch failed — check manually)"
+                    print(f"  Sell order details unavailable — P&L cannot be computed", flush=True)
+                else:
+                    actual_pnl = sell_net - buy_paid
+                    actual_pnl_str = f"${actual_pnl:+.4f}"
+                print(f"  [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Actual P&L: buy_paid={buy_paid:.4f} sell_gross={sell_gross:.4f} sell_fee={sell_fee:.4f} sell_net={sell_net:.4f} pnl={actual_pnl_str}", flush=True)
+        except Exception as e:
+            print(f"  P&L calc error: {e}", flush=True)
+
+        msg = (
+            f"⚡ ARB EXECUTED: {token}\n"
+            f"Bought via {buy_pair} (market) for ${size:.0f}\n"
+            f"Sold {token_balance:.5f} {token} via {sell_pair} (market)\n"
+            f"Expected: {net_bps:.1f}bps | Actual P&L: {actual_pnl_str}\n"
+            f"Buy: {'✅' if buy_rc == 0 else '❌'} | Sell: {'✅' if sell_rc == 0 else '❌'}"
+        )
+        send_alert(msg)
+        return
+
+    # All sizes failed — alert only if balance was the blocker
+    profitable_sizes = []
+    for size in TRADE_SIZES:
+        bv, _ = vwap_from_book(asks_buy,  size, is_ask=True)
+        sv, _ = vwap_from_book(bids_sell, size, is_ask=False)
+        if bv and sv:
+            bps = ((sv*(1-FEE)) - (bv/(1-FEE))) / bv * 10000
+            if bps > MIN_TICKER_BPS:
+                profitable_sizes.append((size, bps))
+
+    if profitable_sizes and buy_balance < profitable_sizes[-1][0]:
+        best_size, best_bps = profitable_sizes[0]
+        msg = (
+            f"⚠️ ARB MISSED (insufficient balance): {token}\n"
+            f"Buy {buy_currency} needed: ${profitable_sizes[-1][0]:.0f} | Available: {buy_balance:.2f}\n"
+            f"Best profitable size: ${best_size:.0f} at {best_bps:.1f}bps"
+        )
+        send_alert(msg)
+    else:
+        print(f"  No executable size for {token} (depth/profit issue)", flush=True)
+
+def screen_token(token):
+    """Ticker screen for a single token — called in parallel."""
+    try:
+        usdc_ask, usdc_bid, usd_ask, usd_bid = get_ticker_pair(token)
+        if not all([usdc_ask, usdc_bid, usd_ask, usd_bid]):
+            return None
+        bps_1 = ((usd_bid*(1-FEE)) - (usdc_ask/(1-FEE))) / usdc_ask * 10000
+        bps_2 = ((usdc_bid*(1-FEE)) - (usd_ask/(1-FEE))) / usd_ask  * 10000
+        if bps_1 > MIN_TICKER_BPS or bps_2 > MIN_TICKER_BPS:
+            return (token, bps_1, bps_2)
+    except:
+        pass
+    return None
+
+def check_and_execute():
+    # Step 1: Ticker screen — all tokens in parallel (4 workers)
+    candidates = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(screen_token, t): t for t in TOKENS}
+        for f in as_completed(futures):
+            result = f.result()
+            if result:
+                candidates.append(result)
+
+    if not candidates:
+        return
+
+    # Sort candidates by best bps descending — execute only the top opportunity
+    candidates.sort(key=lambda c: max(c[1], c[2]), reverse=True)
+    best = candidates[0]
+    token, bps_1, bps_2 = best
+    best_bps = max(bps_1, bps_2)
+    print(f"  [{time.strftime('%H:%M:%S')}] {len(candidates)} candidate(s) — executing best: {token} ({best_bps:.1f}bps)", flush=True)
+    if len(candidates) > 1:
+        others = [(c[0], max(c[1],c[2])) for c in candidates[1:]]
+        print(f"  Skipped: {others}", flush=True)
+
+    # Step 2: Fetch orderbooks for best candidate
+    ob_usdc, ob_usd = get_orderbooks(token)
+    if not ob_usdc or not ob_usd:
+        return
+
+    asks_usdc = ob_usdc["data"]["asks"]
+    bids_usdc = ob_usdc["data"]["bids"]
+    asks_usd  = ob_usd["data"]["asks"]
+    bids_usd  = ob_usd["data"]["bids"]
+
+    # Step 3: Execute best direction
+    if bps_1 >= bps_2 and bps_1 > MIN_TICKER_BPS:
+        execute_arb(token, f"{token}-USDC", "USDC", f"{token}-USD", bps_1, asks_usdc, bids_usd)
+    elif bps_2 > MIN_TICKER_BPS:
+        execute_arb(token, f"{token}-USD", "USD", f"{token}-USDC", bps_2, asks_usd, bids_usdc)
+
+print("Loading pair configs...", flush=True)
+PAIR_DECIMALS.update(load_pair_configs())
+print(f"Loaded {len(PAIR_DECIMALS)} pair configs.", flush=True)
+print(f"Starting USDC/USD arb monitor — parallel OB fetch, pre-buy ticker check, market buy, market sell, every 30s...", flush=True)
+while True:
+    try:
+        check_and_execute()
+        print(f"[{time.strftime('%H:%M:%S')}] Scan complete", flush=True)
+    except Exception as e:
+        print(f"Error: {e}", flush=True)
+    time.sleep(30)
