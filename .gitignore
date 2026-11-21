@@ -8,3 +8,9 @@ __pycache__/
 # scripts still containing plaintext token - move to telegram.env first
 # old updater that pulled the removed cli-k9x2a package
 update-revx-skills.sh
+# non-arbitrage scripts, kept locally only
+pump-scanner.py
+mem-alert.sh
+tg-relay.py
+revx-recovery-watcher.py
+start-revx-monitors.sh
