@@ -37,9 +37,9 @@ TOKENS = [
     "TRX","XLM","XRP"
 ]
 FEE = 0.0009
-MIN_TICKER_BPS = 10
+MIN_TICKER_BPS = 15
 MAX_EDGE_BPS = 100  # edges above this are almost always phantom quotes; skip
-TRADE_SIZES = [1000.0, 500.0, 100.0, 50.0]
+TRADE_SIZES = [500.0, 100.0, 50.0]
 SELL_DEPTH_MULT = 2.0  # sell-leg bids must hold at least this multiple of the trade size
 SELL_DEPTH_WINDOW_BPS = 50  # ...within this many bps of the best bid
 def _load_bot_token():
