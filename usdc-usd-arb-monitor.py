@@ -140,6 +140,20 @@ def get_balance(currency):
         pass
     return 0.0
 
+def get_balance_retry(currency, attempts=10, delay=1.5):
+    """Poll the available balance until it is > 0 (exchange balance can lag a fill).
+    Up to `attempts` reads, `delay` s apart (~15 s total). Returns 0.0 if it never appears."""
+    for i in range(attempts):
+        bal = get_balance(currency)
+        if bal > 0:
+            if i > 0:
+                print(f"  Balance for {currency} appeared on attempt {i+1}", flush=True)
+            return bal
+        if i < attempts - 1:
+            print(f"  {currency} balance 0 (attempt {i+1}/{attempts}) — retrying in {delay}s", flush=True)
+            time.sleep(delay)
+    return 0.0
+
 def vwap_from_book(levels, size_usd, is_ask=True):
     """Returns (vwap, worst_price) or (None, None) if insufficient depth.
     worst_price = max ask level touched (for buy limit price) or min bid level touched."""
@@ -261,9 +275,9 @@ def execute_arb(token, buy_pair, buy_currency, sell_pair, ticker_bps, asks_buy, 
             # Fallback: order get failed — use available balance directly
             log_error(f"order get returned None: {token} {buy_order_id}", extra=f"pair={buy_pair} size={size}")
             print(f"  order get failed — falling back to available balance", flush=True)
-            token_balance = get_balance(token)
+            token_balance = get_balance_retry(token)
             if token_balance <= 0:
-                send_alert(f"⚠️ ARB ERROR: {token} — order get failed and no balance found. Manual check needed!\nOrder: {buy_order_id}")
+                send_alert(f"⚠️ ARB ERROR: {token} — order get failed and no balance found after ~15s of retries. Position may be open — manual check needed!\nOrder: {buy_order_id}")
                 return
             print(f"  Fallback balance: {token_balance:.8f} {token}", flush=True)
             send_alert(f"⚠️ ARB FALLBACK: {token}\nOrder get failed, selling available balance: {token_balance:.5f}\nOrder: {buy_order_id}")
@@ -277,11 +291,11 @@ def execute_arb(token, buy_pair, buy_currency, sell_pair, ticker_bps, asks_buy, 
                 return
 
             # Use actual available balance as sell qty
-            token_balance = get_balance(token)
+            token_balance = get_balance_retry(token)
             print(f"  Available {token} balance for sell: {token_balance:.8f}", flush=True)
 
         if token_balance <= 0:
-            send_alert(f"⚠️ ARB ERROR: {token} — no available balance to sell after buy")
+            send_alert(f"⚠️ ARB ERROR: {token} — no available balance to sell after buy (retried ~15s). Position may be open — manual check needed!")
             return
 
         # Leg 2: Market sell using filled_qty - base_fee from order details
