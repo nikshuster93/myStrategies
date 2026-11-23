@@ -37,7 +37,7 @@ TOKENS = [
     "TRX","XLM","XRP"
 ]
 FEE = 0.0009
-MIN_TICKER_BPS = 15
+MIN_TICKER_BPS = 10
 MAX_EDGE_BPS = 100  # edges above this are almost always phantom quotes; skip
 TRADE_SIZES = [500.0, 100.0, 50.0]
 SELL_DEPTH_MULT = 2.0  # sell-leg bids must hold at least this multiple of the trade size
